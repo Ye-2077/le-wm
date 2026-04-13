@@ -84,6 +84,8 @@ python eval.py --config-name=pusht.yaml policy=pusht/lewm
 python eval.py --config-name=pusht.yaml policy=pusht/lewm_object.ckpt
 ```
 
+For LIBERO evaluation, this repository normalizes the environment action space through a local adapter before handing it to `stable_worldmodel`. This avoids old `gym` / newer `gymnasium` Box-space mismatches that can collapse a 7D continuous action space into a 1D planner input. If you evaluate a checkpoint that was not trained on LIBERO, make sure its action dimension matches the target environment.
+
 ## Pretrained Checkpoints
 
 Pre-trained checkpoints are available on [Google Drive](https://drive.google.com/drive/folders/1r31os0d4-rR0mdHc7OlY_e5nh3XT4r4e). Download the checkpoint archive and place the extracted files under `$STABLEWM_HOME/`.

@@ -3,7 +3,7 @@ mode: single_task
 
 dataset:
   num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
-  frameskip: 1
+  frameskip: 5
   name: libero_placeholder
   keys_to_load:
     - pixels

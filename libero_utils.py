@@ -1,10 +1,14 @@
 import os
+import sys
 from collections import deque
 from dataclasses import dataclass
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
+from gymnasium import spaces
 import numpy as np
+import yaml
 
 
 LIBERO_SUITES = (
@@ -13,6 +17,42 @@ LIBERO_SUITES = (
     "libero_goal",
     "libero_100",
 )
+
+
+def _align_libero_paths():
+    """Prefer this repo's vendored LIBERO assets over any stale global config."""
+    repo_root = Path(__file__).resolve().parent
+    vendored_root = repo_root / "third_party" / "LIBERO" / "libero" / "libero"
+    if not vendored_root.exists():
+        return
+
+    config_dir = repo_root / ".libero"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_file = config_dir / "config.yaml"
+    desired_config = {
+        "benchmark_root": str(vendored_root),
+        "bddl_files": str(vendored_root / "bddl_files"),
+        "init_states": str(vendored_root / "init_files"),
+        "datasets": str(vendored_root.parent / "datasets"),
+        "assets": str(vendored_root / "assets"),
+    }
+
+    current_config = None
+    if config_file.exists():
+        with config_file.open("r") as f:
+            current_config = yaml.safe_load(f) or {}
+
+    if current_config != desired_config:
+        with config_file.open("w") as f:
+            yaml.safe_dump(desired_config, f, sort_keys=False)
+
+    os.environ["LIBERO_CONFIG_PATH"] = str(config_dir)
+
+    # If LIBERO was imported earlier in the process, keep it aligned with the local config.
+    libero_module = sys.modules.get("libero.libero")
+    if libero_module is not None:
+        libero_module.libero_config_path = str(config_dir)
+        libero_module.config_file = str(config_file)
 
 
 def optional_import(module_name: str, install_hint: str):
@@ -25,13 +65,14 @@ def optional_import(module_name: str, install_hint: str):
 
 
 def get_cache_dir(cache_dir: str | os.PathLike | None = None) -> Path:
-    """解析 StableWM 缓存目录，优先使用显式配置，其次读取环境变量。"""
+    """解析 StableWM 缓存目录，优先与 stable_worldmodel 的默认行为保持一致。"""
     if cache_dir is not None:
         return Path(cache_dir).expanduser().resolve()
-    env_dir = os.environ.get("STABLEWM_HOME")
-    if env_dir:
-        return Path(env_dir).expanduser().resolve()
-    return Path.home() / ".stable-wm"
+    swm = optional_import(
+        "stable_worldmodel.data.utils",
+        "Install stable-worldmodel before resolving the default cache directory.",
+    )
+    return Path(swm.get_cache_dir()).expanduser().resolve()
 
 
 def normalize_task_name(name: str) -> str:
@@ -97,6 +138,7 @@ def _resolve_suite_files(
 
 def get_libero_suite_tasks(benchmark_name: str) -> list[dict[str, Any]]:
     """从官方 LIBERO benchmark API 中枚举指定 suite 的任务元信息。"""
+    _align_libero_paths()
     benchmark = optional_import(
         "libero.libero.benchmark",
         "Install LIBERO with `pip install -e .` inside the official repository.",
@@ -122,6 +164,7 @@ def get_libero_suite_tasks(benchmark_name: str) -> list[dict[str, Any]]:
 
 def get_libero_task_suite(benchmark_name: str):
     """构造官方 LIBERO benchmark suite 对象，供仿真评测直接使用。"""
+    _align_libero_paths()
     benchmark = optional_import(
         "libero.libero.benchmark",
         "Install LIBERO with `pip install -e .` inside the official repository.",
@@ -134,6 +177,7 @@ def get_libero_task_suite(benchmark_name: str):
 
 def get_libero_bddl_path(task) -> Path:
     """根据 Libero task 元信息定位对应的 BDDL 文件。"""
+    _align_libero_paths()
     libero_utils = optional_import(
         "libero.libero",
         "Install LIBERO with `pip install -e .` inside the official repository.",
@@ -227,6 +271,7 @@ def _read_demo_arrays(demo_group, obs_key: str, proprio_keys=None, state_keys=No
         "action": actions,
         "proprio": proprio,
         "state": state,
+        "sim_state": np.asarray(demo_group["states"]) if "states" in demo_group else None,
         "obs_key": image_key,
     }
 
@@ -238,6 +283,7 @@ def _init_storage():
         "action": [],
         "proprio": [],
         "state": [],
+        "sim_state": [],
         "ep_idx": [],
         "step_idx": [],
         "task_id": [],
@@ -263,6 +309,9 @@ def _append_episode(storage, arrays, task_name: str, task_id: int, episode_idx: 
         value = arrays[key]
         if value is not None:
             storage[key].append(np.asarray(value[:n_steps], dtype=np.float32))
+
+    if arrays["sim_state"] is not None:
+        storage["sim_state"].append(np.asarray(arrays["sim_state"][:n_steps], dtype=np.float32))
 
 
 def _concat_storage(storage):
@@ -368,6 +417,44 @@ def ensure_libero_cache(cfg_libero) -> tuple[str, Path]:
     return cache_name, output_path
 
 
+def ensure_libero_eval_cache(cfg_eval, cache_dir: str | os.PathLike | None = None) -> tuple[str, Path]:
+    """确保评测所需的 Libero 缓存存在，不存在时自动从原始 demo 转换。"""
+    cache_root = get_cache_dir(cache_dir)
+    cache_name = getattr(cfg_eval, "cache_name", None)
+    if not cache_name:
+        if getattr(cfg_eval, "task_name", None):
+            cache_name = f"libero_{normalize_task_name(cfg_eval.task_name)}"
+        else:
+            cache_name = f"{cfg_eval.benchmark}_multitask"
+
+    output_path = cache_root / f"{cache_name}.h5"
+    force_rebuild = bool(getattr(cfg_eval, "force_rebuild", False))
+    if output_path.exists() and not force_rebuild:
+        try:
+            h5py = optional_import("h5py", "Install h5py to enable Libero dataset loading.")
+            with h5py.File(output_path, "r") as handle:
+                if "sim_state" in handle:
+                    return cache_name, output_path
+        except Exception:
+            pass
+
+    eval_cache_cfg = SimpleNamespace(
+        mode="single_task" if getattr(cfg_eval, "task_name", None) else "suite",
+        benchmark=cfg_eval.benchmark,
+        task_name=getattr(cfg_eval, "task_name", None),
+        dataset_root=cfg_eval.dataset_root,
+        obs_key=cfg_eval.obs_key,
+        cache_name=cache_name,
+        cache_dir=str(cache_root),
+        force_rebuild=True,
+        task_files=getattr(cfg_eval, "task_files", {}) or {},
+        proprio_keys=getattr(cfg_eval, "proprio_keys", None),
+        state_keys=getattr(cfg_eval, "state_keys", None),
+    )
+
+    return ensure_libero_cache(eval_cache_cfg)
+
+
 def load_goal_image_from_file(task_path: Path, obs_key: str) -> np.ndarray:
     """从任务数据中取一张目标图像，作为规划时的 goal observation。"""
     h5py = optional_import("h5py", "Install h5py to enable Libero dataset loading.")
@@ -398,6 +485,37 @@ def fit_libero_action_scaler(task_paths: list[Path]):
         raise ValueError("Could not fit Libero action scaler because no action data was found.")
     scaler.fit(np.concatenate(actions, axis=0))
     return scaler
+
+
+def build_libero_process(task_paths: list[Path], policy_name: str) -> dict[str, Any]:
+    """构建 Libero 评测所需的预处理器，当前只对动作做反标准化。"""
+    process: dict[str, Any] = {}
+    if policy_name != "random":
+        process["action"] = _ActionScalerAdapter(fit_libero_action_scaler(task_paths))
+    return process
+
+
+class _ActionScalerAdapter:
+    """Make sklearn-style action scalers robust to single-action 1D arrays."""
+
+    def __init__(self, scaler):
+        self.scaler = scaler
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        arr = np.asarray(x)
+        original_shape = arr.shape
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        out = self.scaler.transform(arr)
+        return out.reshape(original_shape)
+
+    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+        arr = np.asarray(x)
+        original_shape = arr.shape
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        out = self.scaler.inverse_transform(arr)
+        return out.reshape(original_shape)
 
 
 def extract_pixels_from_obs(obs: Any, obs_key: str):
@@ -435,6 +553,113 @@ def frame_from_env(env, obs: Any, obs_key: str):
     raise RuntimeError("Could not extract frames from Libero env. Ensure the env exposes image obs or render().")
 
 
+def _coerce_action_bounds(low: Any, high: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize action bounds into flat float32 vectors for gymnasium Box spaces."""
+    low = np.asarray(low, dtype=np.float32).reshape(-1)
+    high = np.asarray(high, dtype=np.float32).reshape(-1)
+    if low.shape != high.shape or low.size == 0:
+        raise ValueError(
+            f"Invalid action bounds: low shape {low.shape}, high shape {high.shape}"
+        )
+    return low, high
+
+
+def _box_from_bounds(low: Any, high: Any) -> spaces.Box:
+    """Build a 1D continuous action space from low / high bounds."""
+    low, high = _coerce_action_bounds(low, high)
+    return spaces.Box(low=low, high=high, dtype=np.float32)
+
+
+def _infer_continuous_action_space(env: Any) -> spaces.Box:
+    """Infer a normalized 1D continuous action space from LIBERO / robosuite env metadata."""
+    candidates = [env, getattr(env, "env", None)]
+    if hasattr(env, "robots") and env.robots:
+        candidates.extend(env.robots)
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+
+        action_spec = getattr(candidate, "action_spec", None)
+        if action_spec is not None:
+            low, high = action_spec
+            return _box_from_bounds(low, high)
+
+        action_limits = getattr(candidate, "action_limits", None)
+        if action_limits is not None:
+            low, high = action_limits
+            return _box_from_bounds(low, high)
+
+        action_space = getattr(candidate, "action_space", None)
+        if action_space is not None and getattr(action_space, "shape", None) is not None:
+            low = getattr(action_space, "low", None)
+            high = getattr(action_space, "high", None)
+            if low is not None and high is not None:
+                return _box_from_bounds(low, high)
+
+        action_dim = getattr(candidate, "action_dim", None)
+        if action_dim is not None:
+            dim = int(action_dim)
+            if dim <= 0:
+                raise ValueError(f"Invalid action_dim {dim} exposed by {type(candidate).__name__}")
+            return spaces.Box(
+                low=-np.ones(dim, dtype=np.float32),
+                high=np.ones(dim, dtype=np.float32),
+                dtype=np.float32,
+            )
+
+    raise AttributeError(f"{type(env).__name__} exposes no usable action metadata")
+
+
+def _validate_policy_action_dim(policy) -> None:
+    """Fail early if solver action dimension disagrees with the loaded checkpoint."""
+    solver_dim = getattr(getattr(policy, "solver", None), "action_dim", None)
+    model = getattr(getattr(policy, "solver", None), "model", None)
+    action_encoder = getattr(model, "action_encoder", None)
+    patch_embed = getattr(action_encoder, "patch_embed", None)
+    model_dim = getattr(patch_embed, "in_channels", None)
+
+    if solver_dim is None or model_dim is None:
+        return
+
+    if int(solver_dim) != int(model_dim):
+        raise ValueError(
+            "LIBERO action dimension mismatch: "
+            f"solver configured {int(solver_dim)} dims, "
+            f"but checkpoint action_encoder expects {int(model_dim)} dims. "
+            "This usually means the environment action space was inferred incorrectly "
+            "or the checkpoint was trained for a different action space."
+        )
+
+
+def _repair_solver_action_dim(policy) -> None:
+    """Patch stable_worldmodel CEM solver when it miscomputes 1D Box action dims."""
+    solver = getattr(policy, "solver", None)
+    env = getattr(policy, "env", None)
+    action_space = getattr(env, "action_space", None)
+    shape = getattr(action_space, "shape", None)
+    base_dim = getattr(solver, "_action_dim", None)
+    action_block = int(getattr(getattr(policy, "cfg", None), "action_block", 1))
+
+    if solver is None or shape is None or base_dim is None:
+        return
+
+    per_step_dim = int(np.prod(shape))
+    if per_step_dim <= 0:
+        return
+
+    if int(base_dim) != per_step_dim:
+        solver._action_dim = per_step_dim
+
+    solver_dim = getattr(solver, "action_dim", None)
+    if solver_dim is not None and int(solver_dim) != per_step_dim * action_block:
+        raise ValueError(
+            "Failed to repair LIBERO solver action dimension: "
+            f"expected {per_step_dim * action_block} effective dims after configuration, "
+            f"got {int(solver_dim)}."
+        )
+
+
 @dataclass
 class SingleEnvAdapter:
     """把单环境包装成 stable_worldmodel policy 期望的最小 env 接口。"""
@@ -442,7 +667,7 @@ class SingleEnvAdapter:
 
     @property
     def action_space(self):
-        return self.env.action_space
+        return _infer_continuous_action_space(self.env)
 
     @property
     def num_envs(self):
@@ -466,6 +691,8 @@ class LiberoPolicyAdapter:
         for _ in range(self.history_len):
             self.history.append(first_frame)
         self.policy.set_env(SingleEnvAdapter(env))
+        _repair_solver_action_dim(self.policy)
+        _validate_policy_action_dim(self.policy)
 
     def get_action(self, current_frame: np.ndarray):
         """组装 JEPA 规划所需的 history + goal 输入，并返回当前动作。"""
@@ -509,6 +736,194 @@ def make_libero_policy(cfg, process, transform):
     )
 
 
+def _select_libero_tasks(cfg_eval):
+    suite = get_libero_task_suite(cfg_eval.benchmark)
+    selected_tasks = []
+    for task_id in range(suite.n_tasks):
+        task = suite.get_task(task_id)
+        if getattr(cfg_eval, "task_name", None) and task.name != cfg_eval.task_name:
+            continue
+        selected_tasks.append((task_id, task))
+    if not selected_tasks:
+        raise ValueError("No Libero tasks selected for evaluation.")
+    return suite, selected_tasks
+
+
+def _sample_libero_replay_rows(dataset, cfg_eval, seed: int):
+    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    task_names = dataset.get_col_data("task_name")
+    episode_idx = dataset.get_col_data(col_name).astype(np.int64)
+    step_idx = dataset.get_col_data("step_idx").astype(np.int64)
+    ep_len = np.asarray(dataset.lengths, dtype=np.int64)
+    max_start_idx_by_row = ep_len[episode_idx] - int(cfg_eval.goal_offset_steps) - 1
+
+    valid_mask = step_idx <= max_start_idx_by_row
+    if getattr(cfg_eval, "task_name", None):
+        selected_name = cfg_eval.task_name
+        normalized = np.array(
+            [
+                item.decode("utf-8") if isinstance(item, (bytes, np.bytes_)) else str(item)
+                for item in task_names
+            ],
+            dtype=object,
+        )
+        valid_mask &= normalized == selected_name
+
+    valid_indices = np.nonzero(valid_mask)[0]
+    if len(valid_indices) < int(cfg_eval.num_eval):
+        raise ValueError(
+            f"Not enough valid Libero replay start states: requested {cfg_eval.num_eval}, "
+            f"found {len(valid_indices)}."
+        )
+
+    g = np.random.default_rng(int(seed))
+    sampled = g.choice(valid_indices, size=int(cfg_eval.num_eval), replace=False)
+    sampled = np.sort(sampled)
+    rows = dataset.get_row_data(sampled.tolist())
+    rows["dataset_row"] = sampled
+    rows["goal_row"] = sampled + int(cfg_eval.goal_offset_steps)
+    rows["episode_idx"] = rows.get(col_name, rows.get("ep_idx"))
+    return rows
+
+
+def _build_libero_policy_adapter(policy, env, current_frame, goal_image, cfg):
+    if policy is None:
+        return None
+    adapter = LiberoPolicyAdapter(
+        policy=policy,
+        history_len=getattr(cfg.plan_config, "history_len", 3),
+        goal_image=goal_image,
+        obs_key=cfg.eval.libero.obs_key,
+    )
+    adapter.reset(env, current_frame)
+    return adapter
+
+
+def _coerce_task_name(value: Any) -> str:
+    return value.decode("utf-8") if isinstance(value, (bytes, np.bytes_)) else str(value)
+
+
+def evaluate_libero_replay(cfg, dataset, process, transform):
+    """按其他任务的口径，从 Libero 数据集抽起点和 goal，在仿真中回放评测。"""
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    _align_libero_paths()
+
+    libero_envs = optional_import(
+        "libero.libero.envs",
+        "Install LIBERO with its environment dependencies before running Libero eval.",
+    )
+
+    results_dir = Path(cfg.eval.video.save_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    _, selected_tasks = _select_libero_tasks(cfg.eval.libero)
+    task_by_name = {task.name: (task_id, task) for task_id, task in selected_tasks}
+    task_paths = [
+        _resolve_task_file(task.name, Path(cfg.eval.libero.dataset_root).expanduser().resolve(), explicit_map=dict(getattr(cfg.eval.libero, "task_files", {}) or {}))
+        for _, task in selected_tasks
+    ]
+    process = dict(process) if process else build_libero_process(task_paths, cfg.policy)
+
+    rows = _sample_libero_replay_rows(dataset, cfg.eval, seed=cfg.seed)
+    goal_rows = dataset.get_row_data(rows["goal_row"].tolist())
+
+    metrics_by_task = {}
+    all_success = []
+    all_lengths = []
+    env_cache = {}
+
+    try:
+        policy = make_libero_policy(cfg, process=process, transform=transform)
+        for idx in range(len(rows["dataset_row"])):
+            task_name = _coerce_task_name(rows["task_name"][idx])
+            _, task = task_by_name[task_name]
+
+            if task_name not in env_cache:
+                env_cache[task_name] = libero_envs.OffScreenRenderEnv(
+                    bddl_file_name=str(get_libero_bddl_path(task)),
+                    camera_heights=cfg.eval.img_size,
+                    camera_widths=cfg.eval.img_size,
+                )
+            env = env_cache[task_name]
+
+            env.seed(cfg.seed + idx)
+            env.reset()
+            obs = env.set_init_state(np.asarray(rows["sim_state"][idx], dtype=np.float64))
+            if isinstance(obs, tuple):
+                obs = obs[0]
+
+            current_frame = frame_from_env(env, obs, cfg.eval.libero.obs_key)
+            goal_image = np.asarray(goal_rows["pixels"][idx])
+            policy_adapter = _build_libero_policy_adapter(policy, env, current_frame, goal_image, cfg)
+
+            frames = [current_frame]
+            done = False
+            reward = 0.0
+            info = {}
+            step_count = 0
+
+            while step_count < int(cfg.eval.eval_budget):
+                if cfg.policy == "random":
+                    action = env.action_space.sample()
+                else:
+                    action = policy_adapter.get_action(current_frame)
+
+                step_out = env.step(action)
+                if len(step_out) == 4:
+                    obs, reward, done, info = step_out
+                else:
+                    obs, reward, terminated, truncated, info = step_out
+                    done = bool(terminated or truncated)
+
+                current_frame = frame_from_env(env, obs, cfg.eval.libero.obs_key)
+                frames.append(current_frame)
+                step_count += 1
+                if done:
+                    break
+
+            success = compute_success(done=done, reward=reward, info=info)
+            all_success.append(float(success))
+            all_lengths.append(step_count)
+
+            task_metrics = metrics_by_task.setdefault(
+                task_name,
+                {"success": [], "lengths": []},
+            )
+            task_metrics["success"].append(float(success))
+            task_metrics["lengths"].append(step_count)
+
+            if cfg.eval.video.save_every_episode:
+                filename = (
+                    f"libero_replay__{normalize_task_name(task_name)}"
+                    f"__row_{int(rows['dataset_row'][idx]):06d}"
+                    f"__success_{int(success)}.mp4"
+                )
+                record_episode_video(
+                    results_dir / filename,
+                    frames=frames,
+                    fps=cfg.eval.video.fps,
+                    goal_image=goal_image,
+                )
+    finally:
+        for env in env_cache.values():
+            env.close()
+
+    return {
+        "success_rate": float(np.mean(all_success)) if all_success else 0.0,
+        "avg_episode_length": float(np.mean(all_lengths)) if all_lengths else 0.0,
+        "num_episodes": len(all_success),
+        "tasks": {
+            name: {
+                "success_rate": float(np.mean(item["success"])) if item["success"] else 0.0,
+                "avg_episode_length": float(np.mean(item["lengths"])) if item["lengths"] else 0.0,
+                "num_episodes": len(item["success"]),
+            }
+            for name, item in metrics_by_task.items()
+        },
+        "video_dir": str(results_dir),
+    }
+
+
 def compute_success(done: bool, reward: float, info: dict):
     """从 Libero / Gym 风格 step 返回值中提取 success 标志。"""
     if isinstance(info, dict):
@@ -521,20 +936,59 @@ def compute_success(done: bool, reward: float, info: dict):
     return bool(done or reward > 0)
 
 
-def record_episode_video(video_path: Path, frames: list[np.ndarray], fps: int):
-    """把单条 episode 的帧序列编码为 mp4 视频。"""
+def _prepare_video_panel(image: np.ndarray, target_hw: tuple[int, int] | None = None) -> np.ndarray:
+    """Convert an RGB image into uint8 HWC format, optionally resizing to target size."""
+    pil_image = optional_import("PIL.Image", "Install Pillow to process Libero rollout videos.")
+
+    arr = np.asarray(image)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected image with shape (H, W, C), got {arr.shape}")
+
+    if arr.dtype != np.uint8:
+        if np.issubdtype(arr.dtype, np.floating):
+            arr = np.clip(arr, 0.0, 255.0)
+            if arr.max() <= 1.0:
+                arr = arr * 255.0
+        arr = arr.astype(np.uint8)
+
+    if target_hw is not None and tuple(arr.shape[:2]) != tuple(target_hw):
+        arr = np.asarray(
+            pil_image.fromarray(arr).resize((target_hw[1], target_hw[0]))
+        )
+    return arr
+
+
+def record_episode_video(
+    video_path: Path,
+    frames: list[np.ndarray],
+    fps: int,
+    goal_image: np.ndarray | None = None,
+):
+    """把单条 episode 的帧序列编码为 mp4 视频，可选将目标图拼接在右侧。"""
     if not frames:
         return
     imageio = optional_import("imageio", "Install imageio to save Libero rollout videos.")
     video_path.parent.mkdir(parents=True, exist_ok=True)
+    prepared_goal = None
+    if goal_image is not None:
+        prepared_goal = _prepare_video_panel(goal_image)
+
     with imageio.get_writer(video_path, fps=fps, codec="libx264") as writer:
         for frame in frames:
-            writer.append_data(np.asarray(frame))
+            prepared_frame = _prepare_video_panel(frame)
+            if prepared_goal is not None:
+                goal_panel = _prepare_video_panel(
+                    prepared_goal,
+                    target_hw=tuple(prepared_frame.shape[:2]),
+                )
+                prepared_frame = np.concatenate([prepared_frame, goal_panel], axis=1)
+            writer.append_data(prepared_frame)
 
 
 def evaluate_libero(cfg, process, transform):
     """在官方 Libero 仿真环境中执行 headless rollout，并输出任务级指标与视频。"""
     os.environ.setdefault("MUJOCO_GL", "egl")
+    _align_libero_paths()
 
     libero_envs = optional_import(
         "libero.libero.envs",
@@ -544,24 +998,12 @@ def evaluate_libero(cfg, process, transform):
     results_dir = Path(cfg.eval.video.save_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    suite = get_libero_task_suite(cfg.eval.libero.benchmark)
+    suite, selected_tasks = _select_libero_tasks(cfg.eval.libero)
     dataset_root = Path(cfg.eval.libero.dataset_root).expanduser().resolve()
     task_file_map = dict(getattr(cfg.eval.libero, "task_files", {}) or {})
-    selected_tasks = []
-
-    for task_id in range(suite.n_tasks):
-        task = suite.get_task(task_id)
-        if cfg.eval.libero.task_name and task.name != cfg.eval.libero.task_name:
-            continue
-        selected_tasks.append((task_id, task))
-
-    if not selected_tasks:
-        raise ValueError("No Libero tasks selected for evaluation.")
 
     task_paths = [_resolve_task_file(task.name, dataset_root, explicit_map=task_file_map) for _, task in selected_tasks]
-    process = dict(process)
-    if cfg.policy != "random":
-        process["action"] = fit_libero_action_scaler(task_paths)
+    process = dict(process) if process else build_libero_process(task_paths, cfg.policy)
 
     metrics_by_task = {}
     all_success = []
@@ -640,7 +1082,12 @@ def evaluate_libero(cfg, process, transform):
                         f"{cfg.eval.libero.benchmark}__{normalize_task_name(task.name)}"
                         f"__ep_{episode_idx:03d}__success_{int(success)}.mp4"
                     )
-                    record_episode_video(results_dir / filename, frames=frames, fps=cfg.eval.video.fps)
+                    record_episode_video(
+                        results_dir / filename,
+                        frames=frames,
+                        fps=cfg.eval.video.fps,
+                        goal_image=goal_image,
+                    )
 
             metrics_by_task[task.name] = {
                 "success_rate": float(np.mean(task_success)) if task_success else 0.0,

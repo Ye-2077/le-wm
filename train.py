@@ -2,6 +2,7 @@ import os
 import math
 from functools import partial
 from pathlib import Path
+from typing import Iterable
 
 import hydra
 import lightning as pl
@@ -15,6 +16,62 @@ from jepa import JEPA
 from libero_utils import ensure_libero_cache
 from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+
+
+def _find_incompatible_checkpoint_keys(
+    module: torch.nn.Module,
+    checkpoint_state: dict,
+) -> list[tuple[str, tuple[int, ...], tuple[int, ...]]]:
+    current_state = module.state_dict()
+    incompatible = []
+    for key, tensor in checkpoint_state.items():
+        current_tensor = current_state.get(key)
+        if current_tensor is None or not hasattr(tensor, "shape"):
+            continue
+        if tuple(tensor.shape) != tuple(current_tensor.shape):
+            incompatible.append((key, tuple(tensor.shape), tuple(current_tensor.shape)))
+    return incompatible
+
+
+def _format_incompatible_keys(
+    incompatible: Iterable[tuple[str, tuple[int, ...], tuple[int, ...]]],
+    limit: int = 5,
+) -> str:
+    lines = []
+    for idx, (key, found_shape, expected_shape) in enumerate(incompatible):
+        if idx >= limit:
+            break
+        lines.append(f"{key}: checkpoint {found_shape} != current {expected_shape}")
+    return "; ".join(lines)
+
+
+def _resolve_resume_checkpoint(ckpt_path: Path, module: torch.nn.Module):
+    if not ckpt_path.exists():
+        return None
+
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+    except Exception as exc:
+        print(
+            f"Warning: failed to inspect checkpoint '{ckpt_path}': {exc}. "
+            "Proceeding with normal resume behavior."
+        )
+        return ckpt_path
+
+    state_dict = checkpoint.get("state_dict")
+    if not isinstance(state_dict, dict):
+        return ckpt_path
+
+    incompatible = _find_incompatible_checkpoint_keys(module, state_dict)
+    if not incompatible:
+        return ckpt_path
+
+    details = _format_incompatible_keys(incompatible)
+    print(
+        f"Warning: skipping incompatible checkpoint '{ckpt_path}'. "
+        f"Starting from scratch instead. Mismatched tensors: {details}"
+    )
+    return None
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -205,7 +262,10 @@ def run(cfg):
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=run_dir / f"{cfg.output_model_name}_weights.ckpt",
+        ckpt_path=_resolve_resume_checkpoint(
+            run_dir / f"{cfg.output_model_name}_weights.ckpt",
+            world_model,
+        ),
     )
 
     manager()

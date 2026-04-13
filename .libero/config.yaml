@@ -1,0 +1,5 @@
+benchmark_root: /root/workspace/le-wm/third_party/LIBERO/libero/libero
+bddl_files: /root/workspace/le-wm/third_party/LIBERO/libero/libero/bddl_files
+init_states: /root/workspace/le-wm/third_party/LIBERO/libero/libero/init_files
+datasets: /root/workspace/le-wm/third_party/LIBERO/libero/datasets
+assets: /root/workspace/le-wm/third_party/LIBERO/libero/libero/assets

@@ -38,14 +38,27 @@ python train.py data=libero_suite data.libero.benchmark=libero_object \
 Libero headless simulation evaluation:
 ```bash
 python eval.py --config-name=libero.yaml \
+  eval.backend=libero_sim \
   policy=libero_object/lewm \
   eval.libero.benchmark=libero_object \
   eval.libero.num_episodes_per_task=10
 ```
 
+Libero dataset-replay evaluation aligned with the other tasks:
+```bash
+python eval.py --config-name=libero.yaml \
+  eval.backend=libero_replay \
+  policy=libero_object/lewm \
+  eval.libero.benchmark=libero_object \
+  eval.num_eval=50 \
+  eval.goal_offset_steps=25 \
+  eval.eval_budget=50
+```
+
 To evaluate a single Libero task and save every rollout video:
 ```bash
 python eval.py --config-name=libero.yaml \
+  eval.backend=libero_sim \
   policy=libero_object/lewm \
   eval.libero.benchmark=libero_object \
   eval.libero.task_name=pick_up_the_alphabet_soup_and_place_it_in_the_basket \

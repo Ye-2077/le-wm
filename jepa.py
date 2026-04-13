@@ -66,6 +66,8 @@ class JEPA(nn.Module):
          - T is the time horizon
         """
 
+        # print("rollout action_sequence shape:", action_sequence.shape)
+        
         assert "pixels" in info, "pixels not in info_dict"
         H = info["pixels"].size(2)
         B, S, T = action_sequence.shape[:3]
@@ -128,6 +130,11 @@ class JEPA(nn.Module):
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
         """ Compute the cost of action candidates given an info dict with goal and initial state."""
 
+
+        # print("action_candidates shape:", action_candidates.shape)
+        # print("action_candidates sample:", action_candidates[0, 0] if action_candidates.ndim >= 3 else action_candidates[0])
+
+
         assert "goal" in info_dict, "goal not in info_dict"
 
         device = next(self.parameters()).device
@@ -142,7 +149,7 @@ class JEPA(nn.Module):
             if k.startswith("goal_"):
                 goal[k[len("goal_") :]] = goal.pop(k)
 
-        goal.pop("action")
+        goal.pop("action", None)
         goal = self.encode(goal)
 
         info_dict["goal_emb"] = goal["emb"]

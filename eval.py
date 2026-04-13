@@ -14,7 +14,7 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
-from libero_utils import evaluate_libero
+from libero_utils import evaluate_libero, evaluate_libero_replay, ensure_libero_eval_cache
 
 def img_transform(cfg):
     transform = transforms.Compose(
@@ -53,6 +53,7 @@ def run(cfg: DictConfig):
     """Run evaluation of dinowm vs random policy."""
     
     # using Libero eval
+    # libero_sim
     if cfg.eval.backend == "libero_sim":
         transform = {
             "pixels": img_transform(cfg),
@@ -68,6 +69,32 @@ def run(cfg: DictConfig):
             f.write(OmegaConf.to_yaml(cfg))
             f.write("\n")
             f.write("==== RESULTS ====\n")
+            f.write(f"metrics: {metrics}\n")
+        print(metrics)
+        return
+
+    # libero_replay
+    if cfg.eval.backend == "libero_replay":
+        transform = {
+            "pixels": img_transform(cfg),
+            "goal": img_transform(cfg),
+        }
+        dataset_name, dataset_path = ensure_libero_eval_cache(
+            cfg.eval.libero,
+            cache_dir=cfg.cache_dir,
+        )
+        dataset = get_dataset(cfg, dataset_name)
+        metrics = evaluate_libero_replay(cfg, dataset=dataset, process={}, transform=transform)
+
+        results_path = Path(cfg.eval.video.save_dir) / cfg.output.filename
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        with results_path.open("a") as f:
+            f.write("\n")
+            f.write("==== CONFIG ====\n")
+            f.write(OmegaConf.to_yaml(cfg))
+            f.write("\n")
+            f.write("==== RESULTS ====\n")
+            f.write(f"dataset_cache: {dataset_path}\n")
             f.write(f"metrics: {metrics}\n")
         print(metrics)
         return
