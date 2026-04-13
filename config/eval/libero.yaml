@@ -1,0 +1,38 @@
+defaults:
+  - launcher: local
+  - solver: cem
+  - _self_
+
+dataset:
+  stats: null
+  keys_to_cache:
+    - action
+
+seed: 42
+policy: random
+cache_dir: null
+
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 1
+  history_len: 3
+
+eval:
+  backend: libero_sim
+  img_size: 224
+  libero:
+    benchmark: libero_object
+    task_name: null
+    dataset_root: ${oc.env:LIBERO_DATASET_ROOT,~/.libero/datasets}
+    obs_key: agentview_rgb
+    num_episodes_per_task: 10
+    max_steps: 300
+    task_files: {}
+  video:
+    save_dir: ${hydra:runtime.output_dir}/libero_videos
+    save_every_episode: true
+    fps: 20
+
+output:
+  filename: libero_results.txt

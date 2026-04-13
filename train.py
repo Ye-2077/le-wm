@@ -1,4 +1,5 @@
 import os
+import math
 from functools import partial
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from jepa import JEPA
+from libero_utils import ensure_libero_cache
 from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
@@ -51,7 +53,14 @@ def run(cfg):
     ##       dataset       ##
     #########################
 
-    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
+    dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
+    if cfg.data.backend == "libero":
+        cache_name, _ = ensure_libero_cache(cfg.data.libero)
+        dataset_cfg["name"] = cache_name
+        if cfg.data.libero.get("cache_dir"):
+            dataset_cfg["cache_dir"] = cfg.data.libero.cache_dir
+
+    dataset = swm.data.HDF5Dataset(**dataset_cfg, transform=None)
     transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
     
     with open_dict(cfg):
@@ -72,8 +81,26 @@ def run(cfg):
         dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
     )
 
-    train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
-    val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
+    train = torch.utils.data.DataLoader(
+        train_set,
+        **cfg.loader,
+        shuffle=True,
+        drop_last=True,
+        generator=rnd_gen,
+    )
+    val = torch.utils.data.DataLoader(
+        val_set,
+        **cfg.loader,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    accumulate_grad_batches = cfg.trainer.get("accumulate_grad_batches", 1)
+    steps_per_epoch = max(1, math.ceil(len(train) / accumulate_grad_batches))
+    max_steps = cfg.trainer.get("max_steps", -1)
+    if max_steps is None or max_steps <= 0:
+        max_steps = steps_per_epoch * cfg.trainer.max_epochs
+    warmup_steps = max(1, int(0.01 * max_steps))
     
     ##############################
     ##       model / optim      ##
@@ -127,8 +154,14 @@ def run(cfg):
         'model_opt': {
             "modules": 'model',
             "optimizer": dict(cfg.optimizer),
-            "scheduler": {"type": "LinearWarmupCosineAnnealingLR"},
-            "interval": "epoch",
+            "scheduler": {
+                "type": "LinearWarmupCosineAnnealingLR",
+                "warmup_steps": warmup_steps,
+                "max_steps": max_steps,
+                "warmup_start_lr": 0.0,
+                "eta_min": 0.0,
+            },
+            "interval": "step",
         },
     }
 

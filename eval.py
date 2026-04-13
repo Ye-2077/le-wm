@@ -14,6 +14,8 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
+from libero_utils import evaluate_libero
+
 def img_transform(cfg):
     transform = transforms.Compose(
         [
@@ -49,6 +51,27 @@ def get_dataset(cfg, dataset_name):
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
     """Run evaluation of dinowm vs random policy."""
+    
+    # using Libero eval
+    if cfg.eval.backend == "libero_sim":
+        transform = {
+            "pixels": img_transform(cfg),
+            "goal": img_transform(cfg),
+        }
+        metrics = evaluate_libero(cfg, process={}, transform=transform)
+
+        results_path = Path(cfg.eval.video.save_dir) / cfg.output.filename
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        with results_path.open("a") as f:
+            f.write("\n")
+            f.write("==== CONFIG ====\n")
+            f.write(OmegaConf.to_yaml(cfg))
+            f.write("\n")
+            f.write("==== RESULTS ====\n")
+            f.write(f"metrics: {metrics}\n")
+        print(metrics)
+        return
+
     assert (
         cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
     ), "Planning horizon must be smaller than or equal to eval_budget"

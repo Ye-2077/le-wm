@@ -1,0 +1,30 @@
+backend: libero
+mode: single_task
+
+dataset:
+  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+  frameskip: 1
+  name: libero_placeholder
+  keys_to_load:
+    - pixels
+    - action
+    - proprio
+    - state
+  keys_to_cache:
+    - action
+    - proprio
+    - state
+
+libero:
+  mode: ${data.mode}
+  benchmark: libero_object
+  task_name: null
+  # dataset_root: ${oc.env:LIBERO_DATASET_ROOT,~/.libero/datasets}
+  dataset_root: /Users/ye_mac/Document/workspace/le-wm/.stable-wm/libero_object
+  obs_key: agentview_rgb
+  cache_name: null
+  cache_dir: null
+  force_rebuild: false
+  task_files: {}
+  proprio_keys: null
+  state_keys: null
