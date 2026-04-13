@@ -20,7 +20,7 @@ libero:
   benchmark: libero_object
   task_name: null
   # dataset_root: ${oc.env:LIBERO_DATASET_ROOT,~/.libero/datasets}
-  dataset_root: /Users/ye_mac/Document/workspace/le-wm/.stable-wm/libero_object
+  dataset_root: /mnt/datasets/leworldmodel/.stable-wm/libero_test
   obs_key: agentview_rgb
   cache_name: null
   cache_dir: null

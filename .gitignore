@@ -1,4 +1,4 @@
 wandb
 outputs
 __pycache__
-.stable-wm
+.stable-wmlewm/**/checkpoints/

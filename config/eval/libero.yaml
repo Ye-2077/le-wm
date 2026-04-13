@@ -24,7 +24,7 @@ eval:
   libero:
     benchmark: libero_object
     task_name: null
-    dataset_root: ${oc.env:LIBERO_DATASET_ROOT,~/.libero/datasets}
+    dataset_root: /mnt/datasets/leworldmodel/.stable-wm/libero_test
     obs_key: agentview_rgb
     num_episodes_per_task: 10
     max_steps: 300
